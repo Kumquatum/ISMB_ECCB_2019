@@ -1,0 +1,314 @@
+---
+title: "ISMB/ECCB 2019 - Compte rendu via Twitter"
+author: "Gwenaëlle Lemoine"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+runtime: shiny
+---
+
+## Présentation de la conférence :
+
+La conférence internationale annuelle sur les systèmes intelligents pour la biologie moléculaire (ISMB) est la réunion phare organisée par l'International Society for Computational Biology (ISCB). La conférence de 2019 est la 27e conférence de l'ISMB et est devenue la plus importante conférence de bio-informatique et de biologie computationnelle au monde. Cette année, elle s'associe à la Conférence européenne sur la biologie computationnelle (18e Conférence annuelle) autre conférence centrale dans le domaine pour former l'ISMB/ECCB 2019. Elle se déroula du 21 au 25 juillet, au Centre des congrès de Bâle. Elle a réunit des scientifiques de l'informatique, de la biologie moléculaire, des mathématiques, de la statistique et des domaines connexes. Elle se concentre principalement sur le développement et l'application de méthodes informatiques avancées pour les problèmes biologiques.
+
+```{r config_and_func, echo=FALSE, message=FALSE}
+library(rtweet)
+library(dplyr)
+library(ggplot2)
+library(wordcloud)
+library(tm)
+library(igraph)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  include = TRUE
+)
+
+get_thread_rec <- function(tweet, timeline){
+  # HOTFIX : because first tweet enters not as a tibble as others, retrieving it as tibble through timeline
+  # And : if there is too many query, it *sometimes* randomely return an empty data frame. So while empty, we try to get it.
+  if (!is.data.frame(tweet)) {
+    # A LA BARBAAAAAAAAAARE
+    tweet <- lookup_tweets(tweet$status_id)
+    while (nrow(tweet) == 0) {
+      tweet <- lookup_tweets(tweet$status_id)
+    }
+    # print(tweet)
+    tweet <- tweet %>% select(user_id, status_id, created_at, screen_name, text, source,
+               reply_to_status_id, is_quote, is_retweet, favorite_count, retweet_count,
+               hashtags, media_url, mentions_user_id, location)
+  }
+
+  match <- grep(tweet$status_id, timeline$reply_to_status_id)
+  if (length(match) > 1) {
+    return(list(lapply(match, function(x) get_thread_rec(timeline[x,], timeline)), tweet))
+  } else if (length(match) == 1) {
+    res <- get_thread_rec(timeline[match,], timeline)
+    if (is.data.frame(res)) {
+      return(rbind(res, tweet))
+    } else {
+      return(list(res, tweet))
+    }
+  } else {
+    return(tweet)
+  }
+}
+
+# Make a data.frame of all tweets independently of the threads info
+flatten_thread <- function(thread){
+  if (!is.data.frame(thread)) {
+    return(lapply(thread, flatten_thread) %>% bind_rows)
+  } else {
+    return(thread)
+  }
+}
+```
+
+```{r data_scrap}
+# Getting tweets with hasthags from the conference
+conf_hashtags <- c("#ISMBECCB", "#ISMBECCB19", "#ISMBECCB2019", "#ISMB", "#ISMB19", "#ISMB2019", "#ECCB", "#ECCB19", "#ECCB2019")
+
+# Due to API limitations, tweets are only retrievable 7 to 10 days before. So saving them and using saved data after that.
+if (file.exists("raw_scrap_data.Rdata")) {
+  load("raw_scrap_data.Rdata")
+} else {
+  conf_tweets <- search_tweets(paste0(conf_hashtags, collapse = " OR ", n = 18000)) 
+  # save.image("raw_scrap_data.Rdata") # And commenting it to avoid writting on it and smashing the save in case I fucked up my if :D
+}
+
+# Filtering for days of the conference
+conf_tweets <- conf_tweets %>%
+  filter(created_at >= ISOdate(2019,07,20,22, tz = "UTC") & # UTC = CH + 2 hours, because of summer time change
+         created_at <= ISOdate(2019,07,25,22, tz = "UTC")) %>%
+  arrange(created_at)
+
+# Keeping only needed colums
+conf_tweets <- conf_tweets %>% select(user_id, status_id, created_at, screen_name, text, source,
+                                      reply_to_status_id, is_quote, is_retweet, favorite_count, retweet_count,
+                                      hashtags, media_url, mentions_user_id, location)
+```
+
+```{r whole_analysis, eval = FALSE}
+# Getting threads associated to retrieved tweets
+conf_tweets_and_threads <- lapply(unique(conf_tweets$user_id), function(author, tweets){ # Parsing through author to minimise the timeline call
+  # Making sure to order them so the 1 is really the oldest tweet
+  author_tweets <- tweets[which(tweets$user_id == author),] %>% arrange(created_at)
+  # If it's the only tweet, no need to check thread (aaaand, it make a bug with the select if still trying to do it)
+  if (nrow(author_tweets) > 1) {
+    oldest_tweet <- author_tweets[1,]
+    author_timeline <- get_timeline(author, n = 3200, since_id = oldest_tweet$status_id) %>%
+      select(user_id, status_id, created_at, screen_name, text, source,
+             reply_to_status_id, is_quote, is_retweet, favorite_count, retweet_count,
+             hashtags, media_url, mentions_user_id, location)
+    # author_tweets_list <- apply(author_tweets, 1, function(x) c(x))
+    # tweets_and_threads <- lapply(author_tweets_list, get_thread_rec, timeline = author_timeline)
+    tweets_and_threads <- apply(author_tweets, 1, get_thread_rec, timeline = author_timeline)
+    return(tweets_and_threads)
+  } else {
+    return(author_tweets)
+  }
+}, conf_tweets)
+```
+
+## La conférence vu de ses tweets
+
+*Note: actuellement, les tweets faisant partie d'un thread avec un des hashtag n'ont pas été récupérés*
+
+### Quelques chiffres :
+
+* 5 jours de conférence
+* 21 COSI = thématiques
+* `r nrow(conf_tweets)` tweets
+* `r length(unique(conf_tweets$user_id))` auteurs différents
+* Compte de tweets par hashtag :
+
+```{r plot_hashtag}
+data <- unlist(conf_tweets$hashtags) %>%
+  paste0("#", .) %>%
+  .[which(. %in% conf_hashtags)] %>%
+  data.frame(hashtag = ., stringsAsFactors = FALSE) %>%
+  group_by(hashtag) %>%
+  count
+
+ggplot(data, aes(x = reorder(hashtag, n), y = n)) +
+  geom_bar(stat = "identity") +
+  xlab("Hashtags") + ylab("Nombre de tweets") +
+  coord_flip()
+```
+
+*Note : suite à un cafouillage de la part des organisateurs, un premier hashtag officiel a été donné, puis un autre*
+
+### Fréquence de tweets
+
+```{r tweets_freq}
+# conf_tweets <- hour(conf_tweets$created_at)
+# ggplot(conf_tweets, aes(x=created_at)) + geom_bar(aes(y=(..count..)), binwidth=1)
+ggplot(conf_tweets %>% mutate(created_at = created_at + 2*60*60), aes(x=created_at, fill = (..count..))) + geom_histogram(binwidth = 60*20)  + 
+  # scale_x_datetime(date_breaks = "6 hours", date_labels = "%d %b") +
+  # scale_x_datetime(date_breaks = "12 hours", date_minor_breaks = "6 hours", sec.axis = sec_axis(~.)) +
+  scale_x_datetime(date_breaks = "6 hours", date_labels = "%H:%M",  
+                   # sec.axis = sec_axis(~., breaks = scales::date_breaks("1 day"), labels = scales::date_format("%a"))) +
+                   sec.axis = sec_axis(~., name = " Jour", breaks = scales::date_breaks("1 day"), labels = scales::date_format("%d"))) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab("Heure") + ylab("Nombre de tweets") +
+  scale_fill_gradient(low="palegreen3", high="red3")
+
+```
+
+
+### Résumé syntaxique 
+
+```{r language_processing, }
+tweets_text <- conf_tweets$text %>%
+  strsplit("\\s+|\u00A0", fixed = FALSE) %>% # \u00A0 = non-breaking space, which is not mached by \s
+  unlist %>%
+  data.frame(text = .) %>% 
+  mutate(text = as.character(text)) %>%
+  mutate(cleaned = iconv(text, from = "UTF-8", to = "ASCII//TRANSLIT")) %>%
+  mutate(cleaned = removePunctuation(cleaned)) %>%
+  mutate(cleaned = tolower(cleaned)) %>%
+  filter(cleaned != "") %>% # Empty words because of smileys removed and newline chars
+  filter(!(cleaned %in% stopwords("en")))
+
+words_table <- table(tweets_text$cleaned) %>% as.data.frame %>%
+  filter(Freq < 1000) %>%
+  filter(Freq > 30) # Seems like wordcloud function parameter min.freq isn't taken into account. So filtering here.
+
+# Help to decide min.freq in wordcloud
+#plot(sort(table(words_table$Freq)), log="xy", type="h", ylim = c(0.9,7000))
+
+word_cloud <- wordcloud(words = words_table$Var1, freq = words_table$Freq, random.order = FALSE, colors = brewer.pal(8, "Dark2"))
+# word_cloud <- wordcloud(words = words_table$Var1, freq = words_table$Freq, min.freq = "100",random.order = FALSE, colors = brewer.pal(8, "Dark2"))
+```
+
+```{r hashtag_network, fig.height=12}
+hashtags_net = conf_tweets$hashtags[lapply(conf_tweets$hashtags, length) > 1] %>%
+  lapply(function(x) combn(x, m = 2)) %>%
+  as.data.frame %>%
+  bind_rows %>%
+  setNames(NULL) %>%
+  t %>%
+  as.data.frame %>%
+  mutate(V1 = tolower(V1)) %>%
+  mutate(V2 = tolower(V2)) %>%
+  transform(V2 = ifelse(V2 > V1, V1, V2), V1 = ifelse(V2 > V1, V2, V1)) %>% # Reordering so swaped nodes of an edge to avoid duplicates
+  group_by(V1) %>%
+  count(V2) %>%
+  filter(n > 1) %>% # Pruning so graph is readable
+  graph_from_data_frame(directed = FALSE)
+
+hub_score = hub_score(hashtags_net)
+hub_palette = colorRampPalette(c("lightskyblue", "dodgerblue3"), bias = 100, alpha = TRUE)
+hub_colors = hub_palette(max(hub_score$vector*50)+1)[hub_score$vector*50+1]
+l = layout_with_lgl(hashtags_net)
+
+plot(hashtags_net,
+     l = l,
+     vertex.label.color = rgb(0.2, 0.2, 0.2, 0.7),
+     vertex.label.family = "Helvetica",
+     vertex.label.cex = 0.7,
+     vertex.label.dist = 1,
+     vertex.size = 1 + degree(hashtags_net)^(1/3),
+     edge.width = E(hashtags_net)$n^(1/4),
+     edge.color = rgb(0.3, 0.6, 0.3, 0.2),
+     vertex.frame.color = "white",
+     vertex.color = hub_colors,
+     edge.curved = 0.5,
+     main = "Réseau des hashtags"
+     )
+
+
+# A tester une prochaine fois (source : https://wlandau.github.io/2017/07/25/Fun-with-network-graphs/)
+# library(visNetwork)
+# network_data <- toVisNetworkData(igraph)
+# nodes <- network_data$nodes
+# edges <- network_data$edges
+# edges$arrows <- "to"
+# 
+# visNetwork(nodes = nodes, edges = edges, width = "100%") %>%
+#   visHierarchicalLayout(direction = "LR") %>%
+#   visNodes(physics = FALSE) %>%
+#   visInteraction(navigationButtons = TRUE) %>%
+#   visEvents(type = "once", startStabilizing = "function(){this.fit()}") %>%
+#   visPhysics(stabilization = FALSE)
+```
+
+
+## Le live tweet comme compte rendu
+
+```{r gwen_tweets}
+# Getting gwen tweets
+if (file.exists("gwen_tweets.Rdata")){
+  load("gwen_tweets.Rdata")
+} else {
+  # gwen_tweets <- conf_tweets_and_threads[["1419567618"]] # A retester une fois conf_tweets_and_threads réellement obtenu
+  author <- "1419567618"
+  tweets <- conf_tweets
+  author_tweets <- tweets[which(tweets$user_id == author),] %>% arrange(created_at)
+  oldest_tweet <- author_tweets[1,]
+  author_timeline <- get_timeline(author, n = 3200, since_id = oldest_tweet$status_id) %>%
+    select(user_id, status_id, created_at, screen_name, text, source,
+           reply_to_status_id, is_quote, is_retweet, favorite_count, retweet_count,
+           hashtags, media_url, mentions_user_id, location)
+  gwen_tweets <- apply(author_tweets, 1, get_thread_rec, timeline = author_timeline)
+}
+
+# Flattening tweets
+gwen_tweets_flatten <- flatten_thread(gwen_tweets)
+
+# Threads detection
+gwen_threads <- gwen_tweets[lapply(gwen_tweets, function(x){if(is.data.frame(x)) nrow(x) else length(x)}) > 1]
+resume_table <- lapply(gwen_threads, function(x){if(is.data.frame(x)) x[nrow(x),] else x[[2]]}) %>% 
+  bind_rows %>%
+  mutate(url = paste0("https://twitter.com/GwenaelleL_/status/", status_id)) %>%
+  mutate(text = gsub("\\n", " ", text)) %>%
+  select(text, url)
+```
+
+### Quelques chiffres :
+
+* `r nrow(gwen_tweets_flatten)` tweets regroupés pour la majorités dans des threads
+* `r nrow(gwen_tweets_flatten[which(!is.na(gwen_tweets_flatten$media_url)),])` photos des presentations (ou presque)
+* `r length(gwen_threads)` threads
+* COSIs les plus vus :
+
+```{r COSI_freq}
+COSIs <- resume_table$text %>%
+  stringr::str_extract("^#\\w+") %>%
+  .[which(!is.na(.))] %>% # Removing thread begining by no COSI tag, usually keynotes this time
+  table %>%
+  as.data.frame %>%
+  setNames(c("hashtags", "n"))
+
+ggplot(COSIs, aes(x = reorder(hashtags, n), y = n)) +
+  geom_bar(stat = "identity") +
+  xlab("Hashtags") + ylab("Nombre de threads") +
+  coord_flip()
+```
+
+### Example de thread : Keynote du 24 juillet
+
+<a class="twitter-timeline" data-height="400" data-width="300"
+data-chrome="noheader"
+href="https://twitter.com/GwenaelleL_/timelines/1166738567294586884?ref_src=twsrc%5Etfw">...</a><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script> 
+
+
+### Recherche de contenu parmis les tweets
+
+```{r search_tweets}
+textInput("search", "Mot à rechercher", "co-expression")
+renderTable({
+  gwen_tweets_flatten %>%
+    mutate(url = paste0("https://twitter.com/GwenaelleL_/status/", status_id)) %>%
+    select(text, url) %>%
+    filter(grepl(pattern = input$search, x = text, ignore.case = TRUE))
+})
+```
+
+
+### Liste complète des threads
+
+`r knitr::kable(resume_table, caption="", col.names = c("Tweet de présentation du thread", "URL"))`
